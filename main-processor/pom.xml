@@ -5,4 +5,11 @@
   <version>0.0.1-SNAPSHOT</version>
   <name>ICFP Contest 2014 - Main Processor Simulator</name>
   <description>Simulating the main processor for testing the LambdaManAI.</description>
+  <dependencies>
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+      <version>17.0</version>
+    </dependency>
+  </dependencies>
 </project>
