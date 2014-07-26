@@ -3,7 +3,7 @@ package de.uni_leipzig.life.icfp2014.main;
 import static com.google.common.base.Preconditions.checkArgument;
 
 enum CellContent {
-    WALL(true, true, '#'),
+    WALL(true, false, '#'),
     SPACE(true, true, ' '),
     PILL(true, true, '.'),
     POWER_PILL(true, false, 'o'),
@@ -19,9 +19,9 @@ enum CellContent {
         this.isSafe = isSafe;
         this.isFree = isFree;
         this.symbol = symbol;
-        
+
     }
-    
+
     static CellContent valueOf(int ordinal) {
         checkArgument(ordinal >= 0 && ordinal < values().length, "Given ordinal %s is not in range [0,%s]",
                 ordinal, values().length - 1);
@@ -35,7 +35,7 @@ enum CellContent {
     boolean isFree() {
         return isFree;
     }
-    
+
     public char toSymbol() {
         return symbol;
     }
