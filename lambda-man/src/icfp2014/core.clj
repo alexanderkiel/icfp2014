@@ -120,7 +120,8 @@
      :fns (merge (:fns body) fn)}))
 
 (defn compile-main [cxts [args body]]
-  (let [{:keys [ins] :as body} (compile cxts body)]
+  {:pre [(nil? cxts)]}
+  (let [{:keys [ins] :as body} (compile (list (build-cxt args)) body)]
     (assoc-in body [:ins] (conj ins ['RTN]))))
 
 (defn compile-form [cxts [hd & tl]]
@@ -219,15 +220,22 @@
       (cons state 1))))
 
 (defprog ai [world _]
-  (let [up 0
-        right 1
-        down 2
-        left 3]
+  (let [and (fn [a b] (= 2 (+ a b)))
+        pair= (fn [a b] (and (= (first a) (first b))
+                             (= (rest a) (rest b))))
+        adv-dir (fn [dir] (if (= dir 3) 0 (+ dir 1)))]
     (cons
-      0
-      (fn step [state world]
-        (trace state)
-        (cons (if state 0 1) (if state right left))))))
+      (let [status (second world)] (second status))
+      (fn step [old-loc world]
+        (let [status (second world)
+              cur-loc (second status)
+              cur-dir (second (rest status))]
+          (trace old-loc)
+          (trace cur-loc)
+          (trace cur-dir)
+          (cons
+            cur-loc
+            (if (pair= old-loc cur-loc) (adv-dir cur-dir) cur-dir)))))))
 
 (comment
 
