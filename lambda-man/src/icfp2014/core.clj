@@ -3,6 +3,7 @@
   (:use plumbing.core)
   (:require [clojure.string :as str]
             [clojure.pprint :refer (pprint)]
+            [clojure.repl :refer (pst)]
             [clojure.core.match :refer (match)])
   (:import [clojure.lang ArityException])
   (:refer-clojure :exclude (compile)))
@@ -24,7 +25,7 @@
     >= 'CGTE
     cons 'CONS
     first 'CAR
-    second 'CDR))
+    rest 'CDR))
 
 (defn single-instr [x]
   {:ins [x]})
@@ -33,66 +34,110 @@
   (apply merge-with into compiles))
 
 (defn resolve-symbols
-  "Takes args like [x] and instructions like ['LD x] and returns instructions
-  like ['LD 0 0] were symbols are replaced with there index in args."
-  [args body]
-  (let [arg-map (into {} (map-indexed #(vector %2 %1) args))]
-    (mapv
-      (fn [[cmd sym :as instr]]
-        (if (= 'LD cmd)
-          (if-let [idx (arg-map sym)]
-            ['LD 0 idx]
-            (throw (RuntimeException. (str "Unable to resolve symbol: " sym
-                                           " in this context"))))
-          instr))
-      body)))
+  "Takes a seq of execution contexts like ([x]), a level like 0 and
+  a instruction like ['LD x] and returns a instruction like ['LD 0 0] were
+  symbols are replaced with there index in the first execution context.
+
+  Pops an execution context if a sumbol was not found and calls itself with the
+  rest of the execution contexts and the level incremented."
+  [[cxt & rest] level [cmd sym :as instr]]
+  (println "resolve-symbols - cxt" cxt "instr" instr)
+  (let [cxt-map (into {} (map-indexed #(vector %2 %1) cxt))]
+    (if (= 'LD cmd)
+      (if-let [idx (cxt-map sym)]
+        ['LD level idx]
+        (if rest
+          (resolve-symbols rest (inc level) instr)
+          (throw (RuntimeException. (str "Unable to resolve symbol: " sym
+                                         " in this context")))))
+      instr)))
 
 (declare compile)
 
-(defn compile-op [hd tl arity]
+(defn compile-op [cxts hd tl arity]
   (check-arity tl arity (name hd))
-  (-> (mapv compile tl)
+  (-> (mapv #(compile cxts %) tl)
       (conj (single-instr [(op hd)]))
+      (merge-compiles)))
+
+(defn precompile-let [[bindings & body]]
+  (when-not (even? (count bindings))
+    (throw (IllegalArgumentException. "Expected an even number of forms in
+    binding vector.")))
+  (let [[arg form & rest] bindings]
+    (if rest
+      (list (list 'fn [arg] (precompile-let (cons rest body))) form)
+      (list (apply list 'fn [arg] body) form))))
+
+(comment
+  (precompile-let '([lms (first (rest world))
+                     loc (first (rest lms))]
+                    (trace loc)
+                    (cons state 1)))
+  (compile nil *1)
+  (pst)
+
+  ((fn [lms]
+     (fn [loc]
+       (trace loc)
+       (cons state 1))
+     (first (rest lms))) (first (rest world)))
+  )
+
+(defn compile-trace [cxts [hd & tl :as form]]
+  (when-not (= 'trace hd)
+    (throw (IllegalArgumentException. (str "Expected trace but got " form))))
+  (check-arity tl 1 "trace")
+  (-> (mapv #(compile cxts %) tl)
+      (conj (single-instr ['DBUG]))
       (merge-compiles)))
 
 (def fn-cnt (atom 0))
 
-(defn compile-closure [sigs]
+(defn compile-closure [cxts sigs]
   (let [name (when (symbol? (first sigs)) (first sigs))
         sigs (if name (next sigs) sigs)
         name (or name (symbol (str "fn-" (swap! fn-cnt inc))))
         args (first sigs)
-        body (compile (second sigs))
-        fn {name (resolve-symbols args (conj (:ins body) ['RTN]))}]
+        cxts (cons args cxts)
+        body (merge-compiles (conj (mapv #(compile-trace cxts %)
+                                         (butlast (rest sigs)))
+                                   (compile cxts (last sigs))))
+        resolved-body-ins (mapv #(resolve-symbols cxts 0 %) (:ins body))
+        fn {name (conj resolved-body-ins ['RTN])}]
     {:ins [['LDF name]]
      :fns (into fn (:fns body))}))
 
-(defn compile-main [[args body]]
-  (let [body (compile body)]
-    (update-in body [:ins] #(resolve-symbols args (conj % ['RTN])))))
+(defn compile-main [cxts [args body]]
+  (let [{:keys [ins] :as body} (compile cxts body)
+        ins (mapv #(resolve-symbols (cons args cxts) 0 %) ins)]
+    (assoc-in body [:ins] (conj ins ['RTN]))))
 
-(defn compile-form [[hd & tl]]
+(defn compile-form [cxts [hd & tl]]
   (case hd
     (+ - * / = > >= cons)
-    (compile-op hd tl 2)
+    (compile-op cxts hd tl 2)
 
-    (first second)
-    (compile-op hd tl 1)
+    (first rest)
+    (compile-op cxts hd tl 1)
+
+    let
+    (compile cxts (precompile-let tl))
 
     fn
-    (compile-closure tl)
+    (compile-closure cxts tl)
 
     main
-    (compile-main tl)
+    (compile-main cxts tl)
 
-    (let [compiled-hd (compile hd)
-          compiled-bindings (merge-compiles (map compile tl))]
+    (let [compiled-hd (compile cxts hd)
+          compiled-bindings (merge-compiles (map #(compile cxts %) tl))]
       (merge-compiles [compiled-bindings compiled-hd
                        (single-instr ['AP (count tl)])]))))
 
-(defn compile [x]
+(defn compile [cxts x]
   (cond
-    (sequential? x) (compile-form x)
+    (sequential? x) (compile-form cxts x)
     (symbol? x) (single-instr ['LD x])
     (integer? x) (single-instr ['LDC x])
     :else (throw (IllegalArgumentException. (str "Can't compile: " x)))))
@@ -100,9 +145,12 @@
 (defn ldf-with-sym? [[cmd x]]
   (and (= 'LDF cmd) (symbol? x)))
 
+(defn line-comment? [instr]
+  (every? string? instr))
+
 (defn assemble [{:keys [ins fns] :or {fns {}}}]
   (loop [ins ins]
-    (let [next-addr (count ins)
+    (let [next-addr (count (remove line-comment? ins))
           [part-1 part-2] (split-with (complement ldf-with-sym?) ins)
           [[_ sym] & part-2] part-2]
       (if (seq part-2)
@@ -138,6 +186,15 @@
     (fn step [state world]
       (cons state 1))))
 
+(defprog ai [world _]
+  (cons
+    0
+    (fn step [state world]
+      (let [lms (first (rest world))
+            loc (first (rest lms))]
+        (trace loc)
+        (cons state 1)))))
+
 (comment
   (compile 'x)
   (compile '(+ x y))
@@ -151,5 +208,7 @@
   (emit *1)
 
   (-> always-right-ai compile assemble emit)
+  (->> ai (compile nil) assemble emit)
+  (pst)
   )
 
