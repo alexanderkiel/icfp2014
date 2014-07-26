@@ -15,16 +15,16 @@
 
 (defn op [x]
   (case x
-    + :add
-    - :sub
-    * :mul
-    / :div
-    = :ceq
-    > :cgt
-    >= :cgte
-    cons :cons
-    first :car
-    second :cdr))
+    + 'ADD
+    - 'SUB
+    * 'MUL
+    / 'DIV
+    = 'CEQ
+    > 'CGT
+    >= 'CGTE
+    cons 'CONS
+    first 'CAR
+    second 'CDR))
 
 (defn single-instr [x]
   {:ins [x]})
@@ -33,15 +33,15 @@
   (apply merge-with into compiles))
 
 (defn resolve-symbols
-  "Takes args like [x] and instructions like [:ld x] and returns instructions
-  like [:ld 0 0] were symbols are replaced with there index in args."
+  "Takes args like [x] and instructions like ['LD x] and returns instructions
+  like ['LD 0 0] were symbols are replaced with there index in args."
   [args body]
   (let [arg-map (into {} (map-indexed #(vector %2 %1) args))]
     (mapv
       (fn [[cmd sym :as instr]]
-        (if (= :ld cmd)
+        (if (= 'LD cmd)
           (if-let [idx (arg-map sym)]
-            [:ld 0 idx]
+            ['LD 0 idx]
             (throw (RuntimeException. (str "Unable to resolve symbol: " sym
                                            " in this context"))))
           instr))
@@ -63,13 +63,15 @@
         name (or name (symbol (str "fn-" (swap! fn-cnt inc))))
         args (first sigs)
         body (compile (second sigs))
-        _ (println "body" body)
-        fn {name (resolve-symbols args (conj (:ins body) [:rtn]))}]
-    {:ins [[:ldf name]]
+        fn {name (resolve-symbols args (conj (:ins body) ['RTN]))}]
+    {:ins [['LDF name]]
      :fns (into fn (:fns body))}))
 
-(defn compile-form [[hd & tl :as form]]
-  (println "compile" form)
+(defn compile-main [[args body]]
+  (let [body (compile body)]
+    (update-in body [:ins] #(resolve-symbols args (conj % ['RTN])))))
+
+(defn compile-form [[hd & tl]]
   (case hd
     (+ - * / = > >= cons)
     (compile-op hd tl 2)
@@ -80,39 +82,61 @@
     fn
     (compile-closure tl)
 
+    main
+    (compile-main tl)
+
     (let [compiled-hd (compile hd)
           compiled-bindings (merge-compiles (map compile tl))]
       (merge-compiles [compiled-bindings compiled-hd
-                       (single-instr [:ap (count tl)])]))))
+                       (single-instr ['AP (count tl)])]))))
 
 (defn compile [x]
   (cond
-    (list? x) (compile-form x)
-    (symbol? x) (single-instr [:ld x])
-    (integer? x) (single-instr [:ldc x])
+    (sequential? x) (compile-form x)
+    (symbol? x) (single-instr ['LD x])
+    (integer? x) (single-instr ['LDC x])
     :else (throw (IllegalArgumentException. (str "Can't compile: " x)))))
 
 (defn ldf-with-sym? [[cmd x]]
-  (and (= :ldf cmd) (symbol? x)))
+  (and (= 'LDF cmd) (symbol? x)))
 
-(defn assemble [{:keys [ins fns]}]
-  (loop [ins (conj ins [:rtn])]
-    (println ins)
+(defn assemble [{:keys [ins fns] :or {fns {}}}]
+  (loop [ins ins]
     (let [next-addr (count ins)
           [part-1 part-2] (split-with (complement ldf-with-sym?) ins)
           [[_ sym] & part-2] part-2]
       (if (seq part-2)
         (-> (vec part-1)
-            (conj [:ldf next-addr])
+            (conj ['LDF next-addr (name sym)])
             (into part-2)
+            (into [[(name sym)]])
             (into (fns sym))
             (recur))
         ins))))
 
+(defn emit-instr [instr]
+  {:pre [(vector? instr)]}
+  (let [last (peek instr)]
+    (if (string? last)
+      (if (= 1 (count instr))
+        (println ";" last)
+        (println (format "%-10s; %s" (str/join " " (butlast instr)) last)))
+      (apply println instr))))
+
 (defn emit [ins]
-  (doseq [i ins]
-    (let [[cmd & rest] i]
-      (apply println (str/upper-case (name cmd)) rest))))
+  (doseq [instr ins]
+    (emit-instr instr)))
+
+(defmacro defprog [name args body]
+  `(def ~name '(~'main ~args ~body)))
+
+;; ---- Lambda-Man Interface --------------------------------------------------
+
+(defprog always-right-ai [world _]
+  (cons
+    world
+    (fn step [state world]
+      (cons state 1))))
 
 (comment
   (compile 'x)
@@ -125,5 +149,7 @@
   (pprint *1)
   (assemble *1)
   (emit *1)
+
+  (-> always-right-ai compile assemble emit)
   )
 
