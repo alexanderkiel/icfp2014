@@ -33,24 +33,20 @@
 (defn merge-compiles [compiles]
   (apply merge-with into compiles))
 
-(defn resolve-symbols
-  "Takes a seq of execution contexts like ([x]), a level like 0 and
-  a instruction like ['LD x] and returns a instruction like ['LD 0 0] were
+(defn load-instr
+  "Takes a seq of execution contexts like ({x 0}), a level like 0 and
+  a symbol like x and returns a instruction like ['LD 0 0] were
   symbols are replaced with there index in the first execution context.
 
   Pops an execution context if a sumbol was not found and calls itself with the
   rest of the execution contexts and the level incremented."
-  [[cxt & rest] level [cmd sym :as instr]]
-  (println "resolve-symbols - cxt" cxt "instr" instr)
-  (let [cxt-map (into {} (map-indexed #(vector %2 %1) cxt))]
-    (if (= 'LD cmd)
-      (if-let [idx (cxt-map sym)]
-        ['LD level idx]
-        (if rest
-          (resolve-symbols rest (inc level) instr)
-          (throw (RuntimeException. (str "Unable to resolve symbol: " sym
-                                         " in this context")))))
-      instr)))
+  [[cxt & rest] level sym]
+  (if-let [idx (cxt sym)]
+    ['LD level idx]
+    (if rest
+      (load-instr rest (inc level) sym)
+      (throw (RuntimeException. (str "Unable to resolve symbol: " sym
+                                     " in this context"))))))
 
 (declare compile)
 
@@ -69,20 +65,30 @@
       (list (list 'fn [arg] (precompile-let (cons rest body))) form)
       (list (apply list 'fn [arg] body) form))))
 
-(comment
-  (precompile-let '([lms (first (rest world))
-                     loc (first (rest lms))]
-                    (trace loc)
-                    (cons state 1)))
-  (compile nil *1)
-  (pst)
+(defn precompile-second [tl]
+  (check-arity tl 1 "second")
+  (list 'first (list 'rest (first tl))))
 
-  ((fn [lms]
-     (fn [loc]
-       (trace loc)
-       (cons state 1))
-     (first (rest lms))) (first (rest world)))
-  )
+(def branch-cnt (atom 0))
+
+(defn gen-branch-sym! []
+  (symbol (str "branch-" (swap! branch-cnt inc))))
+
+(defn compile-branch [cxts body]
+  (let [compiled-body (compile cxts body)
+        sym (gen-branch-sym!)
+        fn {sym (conj (:ins compiled-body) ['JOIN])}]
+    {:sym sym :prog {:fns (merge (:fns compiled-body) fn)}}))
+
+(defn compile-if [cxts [test then else :as tl]]
+  (check-arity tl 3 "if")
+  (let [{then-sym :sym compiled-then :prog} (compile-branch cxts then)
+        {else-sym :sym compiled-else :prog} (compile-branch cxts else)]
+    (merge-compiles
+      [(compile cxts test)
+       (single-instr ['SEL then-sym else-sym])
+       compiled-then
+       compiled-else])))
 
 (defn compile-trace [cxts [hd & tl :as form]]
   (when-not (= 'trace hd)
@@ -94,23 +100,27 @@
 
 (def fn-cnt (atom 0))
 
+(defn gen-fn-sym! []
+  (symbol (str "fn-" (swap! fn-cnt inc))))
+
+(defn build-cxt [args]
+  (into {} (map-indexed #(vector %2 %1) args)))
+
 (defn compile-closure [cxts sigs]
   (let [name (when (symbol? (first sigs)) (first sigs))
         sigs (if name (next sigs) sigs)
-        name (or name (symbol (str "fn-" (swap! fn-cnt inc))))
+        name (or name (gen-fn-sym!))
         args (first sigs)
-        cxts (cons args cxts)
+        cxts (cons (build-cxt args) cxts)
         body (merge-compiles (conj (mapv #(compile-trace cxts %)
                                          (butlast (rest sigs)))
                                    (compile cxts (last sigs))))
-        resolved-body-ins (mapv #(resolve-symbols cxts 0 %) (:ins body))
-        fn {name (conj resolved-body-ins ['RTN])}]
+        fn {name (conj (:ins body) ['RTN])}]
     {:ins [['LDF name]]
-     :fns (into fn (:fns body))}))
+     :fns (merge (:fns body) fn)}))
 
 (defn compile-main [cxts [args body]]
-  (let [{:keys [ins] :as body} (compile cxts body)
-        ins (mapv #(resolve-symbols (cons args cxts) 0 %) ins)]
+  (let [{:keys [ins] :as body} (compile cxts body)]
     (assoc-in body [:ins] (conj ins ['RTN]))))
 
 (defn compile-form [cxts [hd & tl]]
@@ -123,6 +133,12 @@
 
     let
     (compile cxts (precompile-let tl))
+
+    second
+    (compile cxts (precompile-second tl))
+
+    if
+    (compile-if cxts tl)
 
     fn
     (compile-closure cxts tl)
@@ -138,28 +154,44 @@
 (defn compile [cxts x]
   (cond
     (sequential? x) (compile-form cxts x)
-    (symbol? x) (single-instr ['LD x])
+    (symbol? x) (single-instr (load-instr cxts 0 x))
     (integer? x) (single-instr ['LDC x])
     :else (throw (IllegalArgumentException. (str "Can't compile: " x)))))
 
-(defn ldf-with-sym? [[cmd x]]
-  (and (= 'LDF cmd) (symbol? x)))
+(defn cmd-with-sym? [[cmd & args]]
+  (and (#{'LDF 'SEL} cmd) (every? symbol? args)))
 
 (defn line-comment? [instr]
   (every? string? instr))
 
+(defn assemble-ldf [part-1 [cmd sym] part-2 fns next-addr]
+  (-> (vec part-1)
+      (conj [cmd next-addr (name sym)])
+      (into part-2)
+      (into [[(name sym)]])
+      (into (fns sym))))
+
+(defn assemble-sel [part-1 [cmd then-sym else-sym] part-2 fns next-addr]
+  (let [then-branch (fns then-sym)
+        else-branch (fns else-sym)]
+    (-> (vec part-1)
+        (conj [cmd next-addr (+ next-addr (count then-branch))
+               (str then-sym " " else-sym)])
+        (into part-2)
+        (into [[(name then-sym)]])
+        (into then-branch)
+        (into [[(name else-sym)]])
+        (into else-branch))))
+
 (defn assemble [{:keys [ins fns] :or {fns {}}}]
   (loop [ins ins]
     (let [next-addr (count (remove line-comment? ins))
-          [part-1 part-2] (split-with (complement ldf-with-sym?) ins)
-          [[_ sym] & part-2] part-2]
+          [part-1 part-2] (split-with (complement cmd-with-sym?) ins)
+          [[cmd :as instr] & part-2] part-2]
       (if (seq part-2)
-        (-> (vec part-1)
-            (conj ['LDF next-addr (name sym)])
-            (into part-2)
-            (into [[(name sym)]])
-            (into (fns sym))
-            (recur))
+        (case cmd
+          LDF (recur (assemble-ldf part-1 instr part-2 fns next-addr))
+          SEL (recur (assemble-sel part-1 instr part-2 fns next-addr)))
         ins))))
 
 (defn emit-instr [instr]
@@ -187,28 +219,20 @@
       (cons state 1))))
 
 (defprog ai [world _]
-  (cons
-    0
-    (fn step [state world]
-      (let [lms (first (rest world))
-            loc (first (rest lms))]
-        (trace loc)
-        (cons state 1)))))
+  (let [up 0
+        right 1
+        down 2
+        left 3]
+    (cons
+      0
+      (fn step [state world]
+        (trace state)
+        (cons (if state 0 1) (if state right left))))))
 
 (comment
-  (compile 'x)
-  (compile '(+ x y))
-  (compile '(fn [x] (+ x x)))
-  (compile '((fn [op x] (op x x)) + 21))
-  (compile '((fn [x] (+ x x)) 21))
-  (compile '((fn [x] ((fn [x] (+ x x)) x)) 21))
-  (compile '((fn main [go] (go 1)) (fn go [n] (* n 2))))
-  (pprint *1)
-  (assemble *1)
-  (emit *1)
 
-  (-> always-right-ai compile assemble emit)
   (->> ai (compile nil) assemble emit)
   (pst)
+
   )
 
