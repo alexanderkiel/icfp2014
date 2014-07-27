@@ -25,7 +25,8 @@
     >= 'CGTE
     cons 'CONS
     first 'CAR
-    rest 'CDR))
+    rest 'CDR
+    nil? 'ATOM))
 
 (defn single-instr [x]
   {:ins [x]})
@@ -147,7 +148,7 @@
     (+ - * / = > >= cons)
     (compile-op cxts hd tl 2 tail-pos)
 
-    (first rest)
+    (first rest nil?)
     (compile-op cxts hd tl 1 tail-pos)
 
     let
@@ -177,16 +178,20 @@
           (merge-compiles)
           (conj-rtn-when-in-tail-pos tail-pos)))))
 
+(defn compile-symbol [cxts x tail-pos]
+  (-> (single-instr (load-instr cxts 0 x))
+          (conj-rtn-when-in-tail-pos tail-pos)))
+
 (defn compile
   ([cxts x]
    (compile cxts x false))
   ([cxts x tail-pos]
    (cond
      (sequential? x) (compile-form cxts x tail-pos)
-     (symbol? x) (-> (single-instr (load-instr cxts 0 x))
-                     (conj-rtn-when-in-tail-pos tail-pos))
+     (symbol? x) (compile-symbol cxts x tail-pos)
      (integer? x) (-> (single-instr ['LDC x])
                       (conj-rtn-when-in-tail-pos tail-pos))
+     (nil? x) (compile cxts 0 tail-pos)
      :else (throw (IllegalArgumentException. (str "Can't compile: " x))))))
 
 (defn cmd-with-sym? [[cmd & args]]
@@ -257,36 +262,77 @@
 ;; ---- Lambda-Man Interface --------------------------------------------------
 
 (defprog ai [world _]
-  (let [and (fn [a b] (= 2 (+ a b)))
+  (let [up 0 right 1 down 2 left 3
+        wall 0 empty 1 pill 2 power-pill 3
+        and (fn [a b] (= 2 (+ a b)))
+        not (fn [a] (if a 0 1))
         pair= (fn [a b] (and (= (first a) (first b))
                              (= (rest a) (rest b))))
-        adv-dir (fn [dir] (if (= dir 3) 0 (+ dir 1)))
-        drop (fn [n coll] (if (> n 0) (recur (- n 1) (rest coll)) coll))]
+        inc (fn [x] (+ x 1))
+        dec (fn [x] (- x 1))
+        inc-dir (fn [dir]
+                  (if (= dir 3) 0 (inc dir)))
+        drop (fn [n coll]
+               (if (and (> n 0) (not (nil? coll)))
+                 (recur (- n 1) (rest coll))
+                 coll))
+        go (fn [loc dir]
+             (let [x (first loc) y (rest loc)]
+               (if (= dir up)
+                 (cons x (dec y))
+                 (if (= dir right)
+                   (cons (inc x) y)
+                   (if (= dir down)
+                     (cons x (inc y))
+                     (cons (dec x) y))))))
+        field-at-loc (fn [map loc]
+                       (let [row (first (drop (rest loc) map))]
+                         (first (drop (first loc) row))))
+        look-ahead (fn [map loc dir]
+                     (field-at-loc map (go loc dir)))
+        look-for (fn [map loc start-dir things num-tries]
+                   (if (= 4 num-tries)
+                     (recur map loc start-dir (rest things) 0)
+                     (if (= (first things) (look-ahead map loc start-dir))
+                       start-dir
+                       (recur map loc (inc-dir start-dir) things (inc num-tries)))))]
     (cons
-      (let [status (second world)] (second status))
-      (fn step [old-loc world]
-        (let [status (second world)
+      0
+      (fn step [state world]
+        (let [map (first world)
+              status (second world)
               cur-loc (second status)
-              cur-dir (second (rest status))]
-          (trace old-loc)
-          (trace cur-loc)
-          (trace cur-dir)
-          (cons
-            cur-loc
-            (if (pair= old-loc cur-loc) (adv-dir cur-dir) cur-dir)))))))
+              cur-dir (second (rest status))
+              best-dir (look-for map cur-loc cur-dir
+                                 (cons power-pill (cons pill (cons empty nil)))
+                                 0)]
+          (cons 0 best-dir))))))
 
-(defprog tail-call-test []
-  ((fn [x] (trace x) (if x (recur (- x 1)) x)) 3))
+(defprog ai-step []
+  )
 
 (defprog let-test []
   (let [x 1 y 2] (+ x y)))
 
+(defprog drop-test []
+  (let [and (fn [a b] (= 2 (+ a b)))
+        not (fn [a] (if a 0 1))
+        drop (fn [n coll]
+               (if (and (> n 0) (not (nil? coll)))
+                 (recur (- n 1) (rest coll))
+                 coll))]
+    (drop 2 nil)))
+
 (comment
 
   (->> ai (compile nil) assemble emit)
+
   (->> tail-call-test (compile nil) assemble emit)
   (->> let-test (compile nil) assemble emit)
+  (->> drop-test (compile nil) assemble emit)
   (pst)
+
+  (drop 2 nil)
 
   )
 
