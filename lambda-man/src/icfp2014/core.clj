@@ -50,11 +50,15 @@
 
 (declare compile)
 
-(defn compile-op [cxts hd tl arity]
+(defn conj-rtn-when-in-tail-pos [prog tail-pos]
+  (update-in prog [:ins] conj-when (when tail-pos ['RTN])))
+
+(defn compile-op [cxts hd tl arity tail-pos]
   (check-arity tl arity (name hd))
   (-> (mapv #(compile cxts %) tl)
       (conj (single-instr [(op hd)]))
-      (merge-compiles)))
+      (merge-compiles)
+      (conj-rtn-when-in-tail-pos tail-pos)))
 
 (defn precompile-let [[bindings & body]]
   (when-not (even? (count bindings))
@@ -74,19 +78,23 @@
 (defn gen-branch-sym! []
   (symbol (str "branch-" (swap! branch-cnt inc))))
 
-(defn compile-branch [cxts body]
-  (let [compiled-body (compile cxts body)
+(defn append-join [prog]
+  (update-in prog [:ins] conj ['JOIN]))
+
+(defn compile-branch [cxts body tail-pos]
+  (let [compiled-body (compile cxts body tail-pos)
+        compiled-body (if tail-pos compiled-body (append-join compiled-body))
         sym (gen-branch-sym!)
-        fn {sym (conj (:ins compiled-body) ['JOIN])}]
+        fn {sym (:ins compiled-body)}]
     {:sym sym :prog {:fns (merge (:fns compiled-body) fn)}}))
 
-(defn compile-if [cxts [test then else :as tl]]
+(defn compile-if [cxts [test then else :as tl] tail-pos]
   (check-arity tl 3 "if")
-  (let [{then-sym :sym compiled-then :prog} (compile-branch cxts then)
-        {else-sym :sym compiled-else :prog} (compile-branch cxts else)]
+  (let [{then-sym :sym compiled-then :prog} (compile-branch cxts then tail-pos)
+        {else-sym :sym compiled-else :prog} (compile-branch cxts else tail-pos)]
     (merge-compiles
       [(compile cxts test)
-       (single-instr ['SEL then-sym else-sym])
+       (single-instr [(if tail-pos 'TSEL 'SEL) then-sym else-sym])
        compiled-then
        compiled-else])))
 
@@ -114,53 +122,75 @@
         cxts (cons (build-cxt args) cxts)
         body (merge-compiles (conj (mapv #(compile-trace cxts %)
                                          (butlast (rest sigs)))
-                                   (compile cxts (last sigs))))
-        fn {name (conj (:ins body) ['RTN])}]
+                                   (compile cxts (last sigs) true)))
+        fn {name (:ins body)}]
     {:ins [['LDF name]]
      :fns (merge (:fns body) fn)}))
+
+(defn compile-recur [cxts tl tail-pos]
+  (when-not tail-pos
+    (throw (IllegalArgumentException. "recur not on tail position")))
+  (let [load-closure-instr (single-instr ['LD 0 (count (first cxts))])]
+    (-> (mapv #(compile cxts %) tl)
+        (conj load-closure-instr)
+        (conj load-closure-instr)
+        (conj (single-instr ['TAP (inc (count (first cxts)))]))
+        (merge-compiles))))
 
 (defn compile-main [cxts [args body]]
   {:pre [(nil? cxts)]}
   (let [{:keys [ins] :as body} (compile (list (build-cxt args)) body)]
     (assoc-in body [:ins] (conj ins ['RTN]))))
 
-(defn compile-form [cxts [hd & tl]]
+(defn compile-form [cxts [hd & tl] tail-pos]
   (case hd
     (+ - * / = > >= cons)
-    (compile-op cxts hd tl 2)
+    (compile-op cxts hd tl 2 tail-pos)
 
     (first rest)
-    (compile-op cxts hd tl 1)
+    (compile-op cxts hd tl 1 tail-pos)
 
     let
-    (compile cxts (precompile-let tl))
+    (compile cxts (precompile-let tl) tail-pos)
 
     second
-    (compile cxts (precompile-second tl))
+    (compile cxts (precompile-second tl) tail-pos)
 
     if
-    (compile-if cxts tl)
+    (compile-if cxts tl tail-pos)
 
     fn
     (compile-closure cxts tl)
+
+    recur
+    (compile-recur cxts tl tail-pos)
 
     main
     (compile-main cxts tl)
 
     (let [compiled-hd (compile cxts hd)
           compiled-bindings (merge-compiles (map #(compile cxts %) tl))]
-      (merge-compiles [compiled-bindings compiled-hd
-                       (single-instr ['AP (count tl)])]))))
+      (-> [compiled-bindings
+           compiled-hd
+           {:ins [(last (:ins compiled-hd))]}
+           (single-instr ['AP (inc (count tl))])]
+          (merge-compiles)
+          (conj-rtn-when-in-tail-pos tail-pos)))))
 
-(defn compile [cxts x]
-  (cond
-    (sequential? x) (compile-form cxts x)
-    (symbol? x) (single-instr (load-instr cxts 0 x))
-    (integer? x) (single-instr ['LDC x])
-    :else (throw (IllegalArgumentException. (str "Can't compile: " x)))))
+(defn compile
+  ([cxts x]
+   (compile cxts x false))
+  ([cxts x tail-pos]
+   (cond
+     (sequential? x) (compile-form cxts x tail-pos)
+     (symbol? x) (-> (single-instr (load-instr cxts 0 x))
+                     (conj-rtn-when-in-tail-pos tail-pos))
+     (integer? x) (-> (single-instr ['LDC x])
+                      (conj-rtn-when-in-tail-pos tail-pos))
+     :else (throw (IllegalArgumentException. (str "Can't compile: " x))))))
 
 (defn cmd-with-sym? [[cmd & args]]
-  (and (#{'LDF 'SEL} cmd) (every? symbol? args)))
+  (and (#{'LDF 'SEL 'TSEL} cmd) (every? symbol? args)))
 
 (defn line-comment? [instr]
   (every? string? instr))
@@ -169,30 +199,43 @@
   (-> (vec part-1)
       (conj [cmd next-addr (name sym)])
       (into part-2)
-      (into [[(name sym)]])
-      (into (fns sym))))
+      ;(into [[(name sym)]])
+      (into (safe-get fns sym))))
+
+(defn assemble-ldf-only [part-1 [cmd sym] part-2 addr]
+  (-> (vec part-1)
+      (conj [cmd addr (name sym)])
+      (into part-2)))
 
 (defn assemble-sel [part-1 [cmd then-sym else-sym] part-2 fns next-addr]
-  (let [then-branch (fns then-sym)
-        else-branch (fns else-sym)]
+  (let [then-branch (safe-get fns then-sym)
+        else-branch (safe-get fns else-sym)]
     (-> (vec part-1)
         (conj [cmd next-addr (+ next-addr (count then-branch))
                (str then-sym " " else-sym)])
         (into part-2)
-        (into [[(name then-sym)]])
+        ;(into [[(name then-sym)]])
         (into then-branch)
-        (into [[(name else-sym)]])
+        ;(into [[(name else-sym)]])
         (into else-branch))))
 
 (defn assemble [{:keys [ins fns] :or {fns {}}}]
-  (loop [ins ins]
+  (loop [ins ins
+         allocated-fns {}]
     (let [next-addr (count (remove line-comment? ins))
           [part-1 part-2] (split-with (complement cmd-with-sym?) ins)
           [[cmd :as instr] & part-2] part-2]
-      (if (seq part-2)
+      (if instr
         (case cmd
-          LDF (recur (assemble-ldf part-1 instr part-2 fns next-addr))
-          SEL (recur (assemble-sel part-1 instr part-2 fns next-addr)))
+          LDF
+          (let [[_ sym] instr]
+            (if-let [addr (allocated-fns sym)]
+              (recur (assemble-ldf-only part-1 instr part-2 addr)
+                     allocated-fns)
+              (recur (assemble-ldf part-1 instr part-2 fns next-addr)
+                     (assoc allocated-fns sym next-addr))))
+          (SEL TSEL)
+          (recur (assemble-sel part-1 instr part-2 fns next-addr) allocated-fns))
         ins))))
 
 (defn emit-instr [instr]
@@ -201,7 +244,7 @@
     (if (string? last)
       (if (= 1 (count instr))
         (println ";" last)
-        (println (format "%-10s; %s" (str/join " " (butlast instr)) last)))
+        (println (format "%-12s; %s" (str/join " " (butlast instr)) last)))
       (apply println instr))))
 
 (defn emit [ins]
@@ -213,17 +256,12 @@
 
 ;; ---- Lambda-Man Interface --------------------------------------------------
 
-(defprog always-right-ai [world _]
-  (cons
-    world
-    (fn step [state world]
-      (cons state 1))))
-
 (defprog ai [world _]
   (let [and (fn [a b] (= 2 (+ a b)))
         pair= (fn [a b] (and (= (first a) (first b))
                              (= (rest a) (rest b))))
-        adv-dir (fn [dir] (if (= dir 3) 0 (+ dir 1)))]
+        adv-dir (fn [dir] (if (= dir 3) 0 (+ dir 1)))
+        drop (fn [n coll] (if (> n 0) (recur (- n 1) (rest coll)) coll))]
     (cons
       (let [status (second world)] (second status))
       (fn step [old-loc world]
@@ -237,9 +275,17 @@
             cur-loc
             (if (pair= old-loc cur-loc) (adv-dir cur-dir) cur-dir)))))))
 
+(defprog tail-call-test []
+  ((fn [x] (trace x) (if x (recur (- x 1)) x)) 3))
+
+(defprog let-test []
+  (let [x 1 y 2] (+ x y)))
+
 (comment
 
   (->> ai (compile nil) assemble emit)
+  (->> tail-call-test (compile nil) assemble emit)
+  (->> let-test (compile nil) assemble emit)
   (pst)
 
   )
