@@ -26,7 +26,7 @@
     cons 'CONS
     first 'CAR
     rest 'CDR
-    nil? 'ATOM))
+    empty? 'ATOM))
 
 (defn single-instr [x]
   {:ins [x]})
@@ -51,15 +51,11 @@
 
 (declare compile)
 
-(defn conj-rtn-when-in-tail-pos [prog tail-pos]
-  (update-in prog [:ins] conj-when (when tail-pos ['RTN])))
-
-(defn compile-op [cxts hd tl arity tail-pos]
+(defn compile-op [cxts hd tl arity]
   (check-arity tl arity (name hd))
-  (-> (mapv #(compile cxts %) tl)
+  (-> (mapv #(compile cxts % false) tl)
       (conj (single-instr [(op hd)]))
-      (merge-compiles)
-      (conj-rtn-when-in-tail-pos tail-pos)))
+      (merge-compiles)))
 
 (defn precompile-let [[bindings & body]]
   (when-not (even? (count bindings))
@@ -70,21 +66,25 @@
       (list (list 'fn [arg] (precompile-let (cons rest body))) form)
       (list (apply list 'fn [arg] body) form))))
 
-(defn precompile-second [tl]
-  (check-arity tl 1 "second")
-  (list 'first (list 'rest (first tl))))
-
 (def branch-cnt (atom 0))
 
 (defn gen-branch-sym! []
   (symbol (str "branch-" (swap! branch-cnt inc))))
+
+(defn append-rtn [ins]
+  {:pre [(vector? ins)]}
+  (case (first (last ins))
+    (TSEL TAP) ins
+    (conj ins ['RTN])))
 
 (defn append-join [prog]
   (update-in prog [:ins] conj ['JOIN]))
 
 (defn compile-branch [cxts body tail-pos]
   (let [compiled-body (compile cxts body tail-pos)
-        compiled-body (if tail-pos compiled-body (append-join compiled-body))
+        compiled-body (if tail-pos
+                        (update-in compiled-body [:ins] append-rtn)
+                        (append-join compiled-body))
         sym (gen-branch-sym!)
         fn {sym (:ins compiled-body)}]
     {:sym sym :prog {:fns (merge (:fns compiled-body) fn)}}))
@@ -124,7 +124,7 @@
         body (merge-compiles (conj (mapv #(compile-trace cxts %)
                                          (butlast (rest sigs)))
                                    (compile cxts (last sigs) true)))
-        fn {name (:ins body)}]
+        fn {name (append-rtn (:ins body))}]
     {:ins [['LDF name]]
      :fns (merge (:fns body) fn)}))
 
@@ -146,16 +146,13 @@
 (defn compile-form [cxts [hd & tl] tail-pos]
   (case hd
     (+ - * / = > >= cons)
-    (compile-op cxts hd tl 2 tail-pos)
+    (compile-op cxts hd tl 2)
 
-    (first rest nil?)
-    (compile-op cxts hd tl 1 tail-pos)
+    (first rest empty?)
+    (compile-op cxts hd tl 1)
 
     let
     (compile cxts (precompile-let tl) tail-pos)
-
-    second
-    (compile cxts (precompile-second tl) tail-pos)
 
     if
     (compile-if cxts tl tail-pos)
@@ -175,12 +172,10 @@
            compiled-hd
            {:ins [(last (:ins compiled-hd))]}
            (single-instr ['AP (inc (count tl))])]
-          (merge-compiles)
-          (conj-rtn-when-in-tail-pos tail-pos)))))
+          (merge-compiles)))))
 
 (defn compile-symbol [cxts x tail-pos]
-  (-> (single-instr (load-instr cxts 0 x))
-          (conj-rtn-when-in-tail-pos tail-pos)))
+  (single-instr (load-instr cxts 0 x)))
 
 (defn compile
   ([cxts x]
@@ -189,8 +184,7 @@
    (cond
      (sequential? x) (compile-form cxts x tail-pos)
      (symbol? x) (compile-symbol cxts x tail-pos)
-     (integer? x) (-> (single-instr ['LDC x])
-                      (conj-rtn-when-in-tail-pos tail-pos))
+     (integer? x) (single-instr ['LDC x])
      (nil? x) (compile cxts 0 tail-pos)
      :else (throw (IllegalArgumentException. (str "Can't compile: " x))))))
 
@@ -261,6 +255,8 @@
 
 ;; ---- Lambda-Man Interface --------------------------------------------------
 
+(def trace println)
+
 (defprog ai [world _]
   (let [up 0 right 1 down 2 left 3
         wall 0 empty 1 pill 2 power-pill 3
@@ -272,10 +268,20 @@
         dec (fn [x] (- x 1))
         inc-dir (fn [dir]
                   (if (= dir 3) 0 (inc dir)))
+        second (fn [coll] (first (rest coll)))
         drop (fn [n coll]
-               (if (and (> n 0) (not (nil? coll)))
+               (if (and (> n 0) (not (empty? coll)))
                  (recur (- n 1) (rest coll))
                  coll))
+        r-reduce (fn [f start coll]
+                   (if (empty? coll)
+                     start
+                     (recur f (f (first coll) start) (rest coll))))
+        map (fn [f coll]
+              (r-reduce (fn [v ret] (cons v ret)) nil
+                        (r-reduce (fn [v ret] (cons (f v) ret)) nil coll)))
+        x (fn [dir] (first dir))
+        y (fn [dir] (rest dir))
         go (fn [loc dir]
              (let [x (first loc) y (rest loc)]
                (if (= dir up)
@@ -295,21 +301,68 @@
                      (recur map loc start-dir (rest things) 0)
                      (if (= (first things) (look-ahead map loc start-dir))
                        start-dir
-                       (recur map loc (inc-dir start-dir) things (inc num-tries)))))]
+                       (recur map loc (inc-dir start-dir) things (inc num-tries)))))
+        pill-query (cons power-pill (cons pill (cons empty nil)))
+        abs (fn [x] (if (>= x 0) x (- 0 x)))
+        dist-vec (fn [l1 l2]
+                   (cons (- (first l2) (first l1))
+                         (- (rest l2) (rest l1))))
+        dist (fn [dist-vec] (+ (abs (first dist-vec)) (abs (rest dist-vec))))
+        min (fn [cmp coll]
+              (r-reduce (fn [v ret] (if (> (cmp ret v) 0) v ret)) (first coll) coll))
+        cmp-of (fn [f] (fn [a b] (- (f a) (f b))))
+        can-go (fn [map loc dir] (> (look-ahead map loc dir) wall))
+        escape-dir (fn [map loc dist-vec]
+                     (if (> (x dist-vec) (y dist-vec))
+                       (if (> 0 (y dist-vec))
+                         (if (can-go map loc down)
+                           down
+                           (if (> 0 (x dist-vec))
+                             right
+                             left))
+                         (if (can-go map loc up)
+                           up
+                           (if (> 0 (x dist-vec))
+                             right
+                             left)))
+                       (if (> 0 (x dist-vec))
+                         (if (can-go map loc right)
+                           right
+                           (if (> 0 (y dist-vec))
+                             down
+                             up))
+                         (if (can-go map loc left)
+                           left
+                           (if (> 0 (y dist-vec))
+                             down
+                             up)))))]
     (cons
       0
       (fn step [state world]
-        (let [map (first world)
-              status (second world)
-              cur-loc (second status)
-              cur-dir (second (rest status))
-              best-dir (look-for map cur-loc cur-dir
-                                 (cons power-pill (cons pill (cons empty nil)))
-                                 0)]
-          (cons 0 best-dir))))))
+        (let [the-map (first world)
+              my-status (second world)
+              cur-loc (second my-status)
+              cur-dir (second (rest my-status))
+              best-pill-dir (look-for the-map cur-loc cur-dir pill-query 0)
+              ghost-statuses (first (drop 2 world))
+              ghost-locs (map second ghost-statuses)
+              ghost-dist-vecs (map (fn [loc] (dist-vec cur-loc loc)) ghost-locs)
+              min-ghost-dist-vec (min (cmp-of dist) ghost-dist-vecs)
+              new-dir (if (> 5 (dist min-ghost-dist-vec))
+                        (escape-dir the-map cur-loc min-ghost-dist-vec)
+                        best-pill-dir)]
+          (trace min-ghost-dist-vec)
+          (trace new-dir)
+          (cons 0 new-dir))))))
 
-(defprog ai-step []
-  )
+(defprog map-test []
+  (let [map (fn [f coll]
+              ((fn [acc f coll]
+                 (if (empty? coll)
+                   acc
+                   (recur (cons (f (first coll)) acc) f (rest coll))))
+               nil f coll))]
+    (map (fn inc [x] (+ x 1)) (cons 1 nil))))
 
 (defprog let-test []
   (let [x 1 y 2] (+ x y)))
@@ -323,6 +376,20 @@
                  coll))]
     (drop 2 nil)))
 
+(defprog abs-test []
+  (let [abs (fn [x] (if (>= x 0) x (- 0 x)))]
+    (abs -1)))
+
+(defprog reduce-test []
+  (let [r-reduce (fn [f start coll]
+                     (if (empty? coll)
+                       start
+                       (recur f (f (first coll) start) (rest coll))))
+          map (fn [f coll]
+                (r-reduce (fn [v ret] (cons v ret)) nil
+                          (r-reduce (fn [v ret] (cons (f v) ret)) nil coll)))]
+    (map (fn [x] (+ x 1)) (cons 1 (cons 2 nil)))))
+
 (comment
 
   (->> ai (compile nil) assemble emit)
@@ -330,6 +397,8 @@
   (->> tail-call-test (compile nil) assemble emit)
   (->> let-test (compile nil) assemble emit)
   (->> drop-test (compile nil) assemble emit)
+  (->> reduce-test (compile nil) assemble emit)
+  (map)
   (pst)
 
   (drop 2 nil)
